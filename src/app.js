@@ -11,15 +11,17 @@ const app = express();
 const allowedOrigins = [
   'http://localhost:5173',
   'http://127.0.0.1:5173',
-  process.env.CLIENT_URL
+  'https://duraz-ber.vercel.app',
+  process.env.CLIENT_URL,
+  process.env.FRONTEND_URL
 ].filter(Boolean);
 
 app.use(cors({
   origin: function (origin, callback) {
-    if (!origin || allowedOrigins.includes(origin)) {
+    if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.vercel.app')) {
       callback(null, true);
     } else {
-      callback(null, true); // En desarrollo permitir orígenes locales
+      callback(null, true); // En desarrollo y pruebas permitir orígenes
     }
   },
   credentials: true
@@ -29,7 +31,7 @@ app.use(express.json());
 app.use(cookieParser());
 
 // Chequeo de salud ultrarrápido para despertar de cold-starts (Render / Atlas)
-app.get('/api/health', (req, res) => {
+app.get(['/api/health', '/health'], (req, res) => {
   const isDbConnected = mongoose.connection.readyState === 1;
   res.json({
     status: 'ok',
@@ -39,10 +41,15 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Rutas principales
+// Rutas principales (con y sin prefijo /api para máxima resiliencia ante despliegues)
 app.use('/api/auth', authRoutes);
+app.use('/auth', authRoutes);
+
 app.use('/api/peaches', peachRoutes);
+app.use('/peaches', peachRoutes);
+
 app.use('/api/analytics', analyticsRoutes);
+app.use('/analytics', analyticsRoutes);
 
 app.get('/', (req, res) => {
   res.json({
