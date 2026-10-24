@@ -1,0 +1,33 @@
+{
+  "name": "durazber-backend",
+  "version": "1.0.0",
+  "description": "API REST para DurazBer - Contador 3D de duraznos y analítica comparativa rodante de 3 meses",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js",
+    "reset": "node src/scripts/resetDatabase.js"
+  },
+  "keywords": [
+    "durazber",
+    "peach",
+    "tracker",
+    "threejs",
+    "mern"
+  ],
+  "author": "Lautaro Leal Del Prete (LLDP)",
+  "license": "ISC",
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^17.4.2",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.3",
+    "mongoose": "^9.7.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
+  }
+}

@@ -1,0 +1,9 @@
+node_modules/
+package-lock.json
+.env
+.env.production
+logs/
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
