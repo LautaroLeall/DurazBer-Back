@@ -1,8 +1,21 @@
 import PeachLog from '../models/PeachLog.js';
 import { pruneOldPeachLogs } from '../utils/cleanupService.js';
+import {
+  getRequestTzOffset,
+  getRelativeLocalDayBoundsUTC,
+  getRelativeLocalMonthBoundsUTC,
+  toLocalDateKey,
+  getLocalParts
+} from '../utils/dateHelper.js';
+
+const DAY_NAMES = ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb'];
+const MONTH_NAMES = [
+  'Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio',
+  'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'
+];
 
 /**
- * Estadísticas reales de los últimos 7 días (Semanal)
+ * Estadísticas reales de los últimos 7 días (Semanal) con 1 SOLA CONSULTA a MongoDB
  */
 export const getWeeklyStats = async (req, res) => {
   try {
@@ -11,35 +24,44 @@ export const getWeeklyStats = async (req, res) => {
       return res.status(401).json({ message: 'No autenticado' });
     }
 
-    const today = new Date();
+    const tzOffset = getRequestTzOffset(req);
+    const dailyGoal = req.user?.dailyGoal || 4;
+
+    const oldestDay = getRelativeLocalDayBoundsUTC(6, tzOffset);
+    const todayBounds = getRelativeLocalDayBoundsUTC(0, tzOffset);
+
+    // 1 SOLA CONSULTA para toda la semana
+    const weekLogs = await PeachLog.find({
+      user: userId,
+      date: { $gte: oldestDay.start, $lte: todayBounds.end }
+    })
+      .select('date peachesCount weightGrams')
+      .lean();
+
+    // Agrupar en memoria O(N) por clave de fecha local YYYY-MM-DD
+    const buckets = new Map();
+    for (const log of weekLogs) {
+      const key = toLocalDateKey(log.date, tzOffset);
+      const current = buckets.get(key) || { count: 0, grams: 0 };
+      const count = log.peachesCount || 1;
+      current.count += count;
+      current.grams += log.weightGrams || count * 150;
+      buckets.set(key, current);
+    }
+
     const days = [];
-    const dayNames = ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb'];
-
-    // Construir los últimos 7 días
     for (let i = 6; i >= 0; i--) {
-      const d = new Date(today);
-      d.setDate(today.getDate() - i);
-      d.setHours(0, 0, 0, 0);
-
-      const nextD = new Date(d);
-      nextD.setHours(23, 59, 59, 999);
-
-      const dayLogs = await PeachLog.find({
-        user: userId,
-        date: { $gte: d, $lte: nextD }
-      });
-
-      const totalCount = dayLogs.reduce((acc, l) => acc + (l.peachesCount || 1), 0);
-      const totalGrams = dayLogs.reduce((acc, l) => acc + (l.weightGrams || 150), 0);
+      const dayInfo = getRelativeLocalDayBoundsUTC(i, tzOffset);
+      const stats = buckets.get(dayInfo.dateKey) || { count: 0, grams: 0 };
 
       days.push({
-        date: d.toISOString().split('T')[0],
-        dayOfWeek: dayNames[d.getDay()],
-        dayNumber: d.getDate(),
-        count: totalCount,
-        grams: totalGrams,
+        date: dayInfo.dateKey,
+        dayOfWeek: DAY_NAMES[dayInfo.dayOfWeek],
+        dayNumber: dayInfo.day,
+        count: stats.count,
+        grams: stats.grams,
         isToday: i === 0,
-        metGoal: totalCount >= (req.user?.dailyGoal || 4)
+        metGoal: stats.count >= dailyGoal
       });
     }
 
@@ -50,7 +72,7 @@ export const getWeeklyStats = async (req, res) => {
       days,
       totalWeekly,
       avgDaily,
-      dailyGoal: req.user?.dailyGoal || 4
+      dailyGoal
     });
   } catch (error) {
     res.status(500).json({ message: `Error al calcular estadísticas semanales: ${error.message}` });
@@ -58,7 +80,7 @@ export const getWeeklyStats = async (req, res) => {
 };
 
 /**
- * Comparativa real de los últimos 3 meses rodantes (Ventana de 3 meses)
+ * Comparativa real de los últimos 3 meses rodantes con 1 SOLA CONSULTA a MongoDB
  */
 export const getThreeMonthComparative = async (req, res) => {
   try {
@@ -67,46 +89,61 @@ export const getThreeMonthComparative = async (req, res) => {
       return res.status(401).json({ message: 'No autenticado' });
     }
 
-    const now = new Date();
-    const months = [];
-    const monthNames = [
-      'Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio',
-      'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'
+    const tzOffset = getRequestTzOffset(req);
+
+    const twoMonthsAgo = getRelativeLocalMonthBoundsUTC(2, tzOffset);
+    const lastMonth = getRelativeLocalMonthBoundsUTC(1, tzOffset);
+    const currentMonth = getRelativeLocalMonthBoundsUTC(0, tzOffset);
+
+    const monthTargets = [
+      { ...twoMonthsAgo, isCurrentMonth: false },
+      { ...lastMonth, isCurrentMonth: false },
+      { ...currentMonth, isCurrentMonth: true }
     ];
 
-    // Iterar estrictamente por los 3 meses: actual, anterior y hace 2 meses
-    for (let i = 2; i >= 0; i--) {
-      const monthStart = new Date(now.getFullYear(), now.getMonth() - i, 1, 0, 0, 0, 0);
-      const monthEnd = new Date(now.getFullYear(), now.getMonth() - i + 1, 0, 23, 59, 59, 999);
+    // 1 SOLA CONSULTA para todo el trimestre
+    const allLogs = await PeachLog.find({
+      user: userId,
+      date: { $gte: twoMonthsAgo.start, $lte: currentMonth.end }
+    })
+      .select('date peachesCount weightGrams')
+      .lean();
 
-      const logs = await PeachLog.find({
-        user: userId,
-        date: { $gte: monthStart, $lte: monthEnd }
-      });
-
-      const totalPeaches = logs.reduce((acc, l) => acc + (l.peachesCount || 1), 0);
-      const totalWeightKg = +(logs.reduce((acc, l) => acc + (l.weightGrams || 150), 0) / 1000).toFixed(2);
-
-      months.push({
-        monthIndex: monthStart.getMonth(),
-        monthName: monthNames[monthStart.getMonth()],
-        year: monthStart.getFullYear(),
-        label: `${monthNames[monthStart.getMonth()]} ${monthStart.getFullYear()}`,
-        totalPeaches,
-        totalWeightKg,
-        entriesCount: logs.length,
-        isCurrentMonth: i === 0
-      });
+    // Agrupar en memoria por clave YYYY-M
+    const monthBuckets = new Map();
+    for (const log of allLogs) {
+      const parts = getLocalParts(log.date, tzOffset);
+      const key = `${parts.year}-${parts.month}`;
+      const bucket = monthBuckets.get(key) || { totalPeaches: 0, totalGrams: 0, entriesCount: 0 };
+      const count = log.peachesCount || 1;
+      bucket.totalPeaches += count;
+      bucket.totalGrams += log.weightGrams || count * 150;
+      bucket.entriesCount += 1;
+      monthBuckets.set(key, bucket);
     }
 
-    const cutoffDate = new Date();
-    cutoffDate.setMonth(cutoffDate.getMonth() - 3);
+    const months = monthTargets.map((m) => {
+      const key = `${m.year}-${m.monthIndex}`;
+      const stats = monthBuckets.get(key) || { totalPeaches: 0, totalGrams: 0, entriesCount: 0 };
+      const monthName = MONTH_NAMES[m.monthIndex];
+
+      return {
+        monthIndex: m.monthIndex,
+        monthName,
+        year: m.year,
+        label: `${monthName} ${m.year}`,
+        totalPeaches: stats.totalPeaches,
+        totalWeightKg: +(stats.totalGrams / 1000).toFixed(2),
+        entriesCount: stats.entriesCount,
+        isCurrentMonth: m.isCurrentMonth
+      };
+    });
 
     res.json({
       retentionPolicy: {
         maxMonths: 3,
         description: 'Almacenamiento ultra-liviano: base de datos optimizada con purga automática cada 3 meses',
-        cutoffDate: cutoffDate.toISOString().split('T')[0]
+        cutoffDate: twoMonthsAgo.start.toISOString().split('T')[0]
       },
       months
     });

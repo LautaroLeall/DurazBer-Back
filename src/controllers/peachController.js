@@ -1,13 +1,52 @@
 import PeachLog from '../models/PeachLog.js';
 import User from '../models/User.js';
 import { calculateUserStreak } from '../utils/streakHelper.js';
+import {
+  getRequestTzOffset,
+  getRelativeLocalDayBoundsUTC,
+  getLocalDayBoundsUTC
+} from '../utils/dateHelper.js';
 
-const calculateNutrients = (count = 1) => {
+const calculateNutrients = (count = 0) => {
   return {
     kcal: count * 63,
     fiberGrams: +(count * 2.3).toFixed(1),
     vitCPercent: Math.min(count * 17, 100),
     waterPercent: 89
+  };
+};
+
+/**
+ * Construye el resumen completo del día actual en la zona horaria del usuario
+ * ejecutando la consulta de registros del día y el cálculo de racha en paralelo.
+ */
+const buildTodaySummary = async (userId, dailyGoal = 4, tzOffset = 180) => {
+  const { start, end, dateKey } = getRelativeLocalDayBoundsUTC(0, tzOffset);
+
+  const [todayLogs, streak] = await Promise.all([
+    PeachLog.find({
+      user: userId,
+      date: { $gte: start, $lte: end }
+    })
+      .sort({ date: -1 })
+      .lean(),
+    calculateUserStreak(userId, tzOffset)
+  ]);
+
+  const totalPeaches = todayLogs.reduce((acc, log) => acc + (log.peachesCount || 1), 0);
+  const nutrients = calculateNutrients(totalPeaches);
+  const progressPercent = Math.min(Math.round((totalPeaches / dailyGoal) * 100), 100);
+
+  return {
+    date: new Date().toISOString(),
+    dateKey,
+    totalPeaches,
+    dailyGoal,
+    streak,
+    progressPercent,
+    isGoalReached: totalPeaches >= dailyGoal,
+    nutrients,
+    todayLogs
   };
 };
 
@@ -21,43 +60,18 @@ export const getTodaySummary = async (req, res) => {
       return res.status(401).json({ message: 'No autenticado' });
     }
 
-    const startOfDay = new Date();
-    startOfDay.setHours(0, 0, 0, 0);
-
-    const endOfDay = new Date();
-    endOfDay.setHours(23, 59, 59, 999);
-
-    const todayLogs = await PeachLog.find({
-      user: userId,
-      date: { $gte: startOfDay, $lte: endOfDay }
-    }).sort({ date: -1 });
-
-    const totalPeaches = todayLogs.reduce((acc, log) => acc + (log.peachesCount || 1), 0);
-    const nutrients = calculateNutrients(totalPeaches);
-
+    const tzOffset = getRequestTzOffset(req);
     const dailyGoal = req.user?.dailyGoal || 4;
-    const progressPercent = Math.min(Math.round((totalPeaches / dailyGoal) * 100), 100);
+    const summary = await buildTodaySummary(userId, dailyGoal, tzOffset);
 
-    // Calcular racha en tiempo real según regla de >= 1 durazno por día
-    const streak = await calculateUserStreak(userId);
-
-    res.json({
-      date: new Date().toISOString(),
-      totalPeaches,
-      dailyGoal,
-      streak,
-      progressPercent,
-      isGoalReached: totalPeaches >= dailyGoal,
-      nutrients,
-      todayLogs
-    });
+    res.json(summary);
   } catch (error) {
     res.status(500).json({ message: `Error al obtener resumen: ${error.message}` });
   }
 };
 
 /**
- * Sumar duraznos (+1, +2) directamente a la base de datos
+ * Sumar duraznos (+1, +2) directamente a la base de datos y devolver el resumen actualizado
  */
 export const quickIncrement = async (req, res) => {
   try {
@@ -66,26 +80,30 @@ export const quickIncrement = async (req, res) => {
       return res.status(401).json({ message: 'No autenticado' });
     }
 
-    const amount = Number(req.body.amount) || 1;
+    const tzOffset = getRequestTzOffset(req);
+    const dailyGoal = req.user?.dailyGoal || 4;
+    const amount = Math.max(1, Math.min(20, Number(req.body.amount) || 1));
     const nutrients = calculateNutrients(amount);
 
-    const newLog = await PeachLog.create({
-      user: userId,
-      date: new Date(),
-      peachesCount: amount,
-      weightGrams: amount * 150,
-      mealType: req.body.mealType || 'Snack',
-      nutrients
-    });
+    const [newLog] = await Promise.all([
+      PeachLog.create({
+        user: userId,
+        date: new Date(),
+        peachesCount: amount,
+        weightGrams: amount * 150,
+        mealType: req.body.mealType || 'Snack',
+        nutrients
+      }),
+      User.findByIdAndUpdate(userId, { lastActiveDate: new Date() })
+    ]);
 
-    // Actualizar última actividad del usuario y recalcular racha
-    await User.findByIdAndUpdate(userId, { lastActiveDate: new Date() });
-    const streak = await calculateUserStreak(userId);
+    const summary = await buildTodaySummary(userId, dailyGoal, tzOffset);
 
     res.status(201).json({
       message: `¡Sumaste ${amount} durazno(s) a tu cosecha!`,
       log: newLog,
-      streak
+      streak: summary.streak,
+      summary
     });
   } catch (error) {
     res.status(500).json({ message: `Error al sumar durazno: ${error.message}` });
@@ -93,7 +111,7 @@ export const quickIncrement = async (req, res) => {
 };
 
 /**
- * Restar 1 durazno (o eliminar la última toma) en la base de datos
+ * Restar 1 durazno (o eliminar la última toma del día local) en la base de datos
  */
 export const quickDecrement = async (req, res) => {
   try {
@@ -102,16 +120,21 @@ export const quickDecrement = async (req, res) => {
       return res.status(401).json({ message: 'No autenticado' });
     }
 
-    const startOfDay = new Date();
-    startOfDay.setHours(0, 0, 0, 0);
+    const tzOffset = getRequestTzOffset(req);
+    const dailyGoal = req.user?.dailyGoal || 4;
+    const { start, end } = getRelativeLocalDayBoundsUTC(0, tzOffset);
 
     const latestLog = await PeachLog.findOne({
       user: userId,
-      date: { $gte: startOfDay }
+      date: { $gte: start, $lte: end }
     }).sort({ date: -1 });
 
     if (!latestLog) {
-      return res.status(400).json({ message: 'No hay duraznos registrados hoy para restar' });
+      const summary = await buildTodaySummary(userId, dailyGoal, tzOffset);
+      return res.status(400).json({
+        message: 'No hay duraznos registrados hoy para restar',
+        summary
+      });
     }
 
     if (latestLog.peachesCount > 1) {
@@ -119,12 +142,22 @@ export const quickDecrement = async (req, res) => {
       latestLog.weightGrams = latestLog.peachesCount * 150;
       latestLog.nutrients = calculateNutrients(latestLog.peachesCount);
       await latestLog.save();
-      const streak = await calculateUserStreak(userId);
-      return res.json({ message: 'Se restó 1 durazno', log: latestLog, streak });
+      const summary = await buildTodaySummary(userId, dailyGoal, tzOffset);
+      return res.json({
+        message: 'Se restó 1 durazno',
+        log: latestLog,
+        streak: summary.streak,
+        summary
+      });
     } else {
       await PeachLog.findByIdAndDelete(latestLog._id);
-      const streak = await calculateUserStreak(userId);
-      return res.json({ message: 'Se eliminó la toma de durazno', deletedId: latestLog._id, streak });
+      const summary = await buildTodaySummary(userId, dailyGoal, tzOffset);
+      return res.json({
+        message: 'Se eliminó la toma de durazno',
+        deletedId: latestLog._id,
+        streak: summary.streak,
+        summary
+      });
     }
   } catch (error) {
     res.status(500).json({ message: `Error al restar durazno: ${error.message}` });
@@ -132,7 +165,7 @@ export const quickDecrement = async (req, res) => {
 };
 
 /**
- * Historial real por día
+ * Historial real por día respetando el huso horario del usuario
  */
 export const getHistoryLogs = async (req, res) => {
   try {
@@ -141,23 +174,23 @@ export const getHistoryLogs = async (req, res) => {
       return res.status(401).json({ message: 'No autenticado' });
     }
 
+    const tzOffset = getRequestTzOffset(req);
     const { date, limit = 50 } = req.query;
     const filter = { user: userId };
 
     if (date) {
-      // Parsear año, mes y día en hora local para evitar desfase de zona horaria
-      const parts = date.split('-').map(Number);
-      if (parts.length === 3) {
+      const parts = String(date).split('-').map(Number);
+      if (parts.length === 3 && !parts.some(Number.isNaN)) {
         const [year, month, day] = parts;
-        const start = new Date(year, month - 1, day, 0, 0, 0, 0);
-        const end = new Date(year, month - 1, day, 23, 59, 59, 999);
+        const { start, end } = getLocalDayBoundsUTC(year, month - 1, day, tzOffset);
         filter.date = { $gte: start, $lte: end };
       }
     }
 
     const logs = await PeachLog.find(filter)
       .sort({ date: -1 })
-      .limit(Number(limit));
+      .limit(Number(limit))
+      .lean();
 
     res.json(logs);
   } catch (error) {
@@ -166,7 +199,7 @@ export const getHistoryLogs = async (req, res) => {
 };
 
 /**
- * Eliminar una toma individual
+ * Eliminar una toma individual y devolver resumen actualizado
  */
 export const deleteLog = async (req, res) => {
   try {
@@ -175,12 +208,22 @@ export const deleteLog = async (req, res) => {
       return res.status(401).json({ message: 'No autenticado' });
     }
 
+    const tzOffset = getRequestTzOffset(req);
+    const dailyGoal = req.user?.dailyGoal || 4;
+
     const log = await PeachLog.findOneAndDelete({ _id: req.params.id, user: userId });
     if (!log) {
       return res.status(404).json({ message: 'Registro no encontrado' });
     }
-    const streak = await calculateUserStreak(userId);
-    res.json({ message: 'Registro eliminado', id: req.params.id, deletedLog: log, streak });
+
+    const summary = await buildTodaySummary(userId, dailyGoal, tzOffset);
+    res.json({
+      message: 'Registro eliminado',
+      id: req.params.id,
+      deletedLog: log,
+      streak: summary.streak,
+      summary
+    });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
