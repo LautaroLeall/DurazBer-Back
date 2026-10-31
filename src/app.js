@@ -24,7 +24,8 @@ app.use(cors({
       callback(null, true); // En desarrollo y pruebas permitir orígenes
     }
   },
-  credentials: true
+  credentials: true,
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-timezone-offset']
 }));
 
 app.use(express.json());
