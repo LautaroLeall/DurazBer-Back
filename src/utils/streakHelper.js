@@ -1,54 +1,58 @@
 import PeachLog from '../models/PeachLog.js';
 import User from '../models/User.js';
+import { getRelativeLocalDayBoundsUTC, toLocalDateKey } from './dateHelper.js';
 
 /**
- * Calcula la racha consecutiva 100% REAL de consumo de duraznos.
+ * Calcula la racha consecutiva 100% REAL de consumo de duraznos con 1 SOLA CONSULTA a MongoDB.
  * Regla estricta:
- * - Se debe comer mínimo 1 durazno por día.
- * - Si hoy se comieron 0 duraznos, la racha es 0 (se reinicia a cero).
+ * - Se debe comer mínimo 1 durazno por día (según la zona horaria del usuario).
+ * - Si hoy se comieron 0 duraznos, la racha activa es 0.
  * - Si hoy se comió al menos 1 durazno, la racha es 1 + días previos consecutivos con >= 1 durazno.
  */
-export const calculateUserStreak = async (userId) => {
+export const calculateUserStreak = async (userId, tzOffsetMinutes = 180) => {
   try {
     if (!userId) return 0;
 
-    const now = new Date();
-    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
-    const endOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+    const todayBounds = getRelativeLocalDayBoundsUTC(0, tzOffsetMinutes);
+    const oldestBounds = getRelativeLocalDayBoundsUTC(90, tzOffsetMinutes);
 
-    // 1. Verificar si hoy comió al menos un durazno
-    const todayLogs = await PeachLog.find({
+    // 1 SOLA CONSULTA indexada por { user: 1, date: -1 } para toda la ventana de 90 días
+    const logs = await PeachLog.find({
       user: userId,
-      date: { $gte: startOfToday, $lte: endOfToday }
-    });
+      date: { $gte: oldestBounds.start, $lte: todayBounds.end }
+    })
+      .select('date peachesCount')
+      .lean();
 
-    const totalPeachesToday = todayLogs.reduce((sum, log) => sum + (log.peachesCount || 1), 0);
-
-    // Si hoy no ha comido ningún durazno, la racha activa de hoy es 0
-    if (totalPeachesToday === 0) {
+    if (!logs || logs.length === 0) {
       await User.findByIdAndUpdate(userId, { streak: 0 });
       return 0;
     }
 
-    // 2. Si hoy sí comió, racha base = 1. Chequeamos días consecutivos hacia atrás
+    // Agrupar cantidad de duraznos por día local (YYYY-MM-DD) en memoria O(N)
+    const countByDateKey = new Map();
+    for (const log of logs) {
+      const key = toLocalDateKey(log.date, tzOffsetMinutes);
+      const prev = countByDateKey.get(key) || 0;
+      countByDateKey.set(key, prev + (log.peachesCount || 1));
+    }
+
+    const totalPeachesToday = countByDateKey.get(todayBounds.dateKey) || 0;
+
+    // Si hoy no ha comido ningún durazno, la racha activa es 0
+    if (totalPeachesToday < 1) {
+      await User.findByIdAndUpdate(userId, { streak: 0 });
+      return 0;
+    }
+
+    // Si hoy sí comió, racha base = 1 y verificamos días previos consecutivos en el Map en memoria
     let streak = 1;
-    let checkDay = new Date(startOfToday);
-
-    // Revisar hasta 90 días hacia atrás (ventana máxima de 3 meses)
     for (let i = 1; i <= 90; i++) {
-      checkDay.setDate(checkDay.getDate() - 1);
-      const dayStart = new Date(checkDay.getFullYear(), checkDay.getMonth(), checkDay.getDate(), 0, 0, 0, 0);
-      const dayEnd = new Date(checkDay.getFullYear(), checkDay.getMonth(), checkDay.getDate(), 23, 59, 59, 999);
-
-      const pastLog = await PeachLog.findOne({
-        user: userId,
-        date: { $gte: dayStart, $lte: dayEnd }
-      });
-
-      if (pastLog && pastLog.peachesCount >= 1) {
+      const pastDay = getRelativeLocalDayBoundsUTC(i, tzOffsetMinutes);
+      const count = countByDateKey.get(pastDay.dateKey) || 0;
+      if (count >= 1) {
         streak += 1;
       } else {
-        // Se rompió la secuencia consecutiva
         break;
       }
     }
