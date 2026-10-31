@@ -1,10 +1,12 @@
 import User from '../models/User.js';
 import { generateToken } from '../utils/generateToken.js';
 import { calculateUserStreak } from '../utils/streakHelper.js';
+import { getRequestTzOffset } from '../utils/dateHelper.js';
 
 export const registerUser = async (req, res) => {
   try {
     const { name, email, password, dailyGoal } = req.body;
+    const tzOffset = getRequestTzOffset(req);
 
     const userExists = await User.findOne({ email });
     if (userExists) {
@@ -20,7 +22,7 @@ export const registerUser = async (req, res) => {
     });
 
     const token = generateToken(res, user._id);
-    const streak = await calculateUserStreak(user._id);
+    const streak = await calculateUserStreak(user._id, tzOffset);
 
     res.status(201).json({
       _id: user._id,
@@ -39,6 +41,8 @@ export const registerUser = async (req, res) => {
 export const loginUser = async (req, res) => {
   try {
     const { email, password } = req.body;
+    const tzOffset = getRequestTzOffset(req);
+
     if (!email || !password) {
       return res.status(400).json({ message: 'Por favor completá correo y contraseña' });
     }
@@ -47,7 +51,7 @@ export const loginUser = async (req, res) => {
 
     if (user && (await user.comparePassword(password))) {
       const token = generateToken(res, user._id);
-      const streak = await calculateUserStreak(user._id);
+      const streak = await calculateUserStreak(user._id, tzOffset);
       res.json({
         _id: user._id,
         name: user.name,
@@ -75,9 +79,10 @@ export const logoutUser = (req, res) => {
 
 export const getUserProfile = async (req, res) => {
   try {
+    const tzOffset = getRequestTzOffset(req);
     const user = await User.findById(req.user._id).select('-password');
     if (user) {
-      const streak = await calculateUserStreak(user._id);
+      const streak = await calculateUserStreak(user._id, tzOffset);
       const userObj = user.toObject();
       userObj.streak = streak;
       res.json(userObj);
@@ -91,13 +96,14 @@ export const getUserProfile = async (req, res) => {
 
 export const updateUserProfile = async (req, res) => {
   try {
+    const tzOffset = getRequestTzOffset(req);
     const user = await User.findById(req.user._id);
     if (!user) {
       return res.status(404).json({ message: 'Usuario no encontrado' });
     }
 
     user.name = req.body.name || user.name;
-    user.dailyGoal = req.body.dailyGoal !== undefined ? req.body.dailyGoal : user.dailyGoal;
+    user.dailyGoal = req.body.dailyGoal !== undefined ? Number(req.body.dailyGoal) : user.dailyGoal;
     user.avatar = req.body.avatar || user.avatar;
 
     if (req.body.password) {
@@ -105,7 +111,7 @@ export const updateUserProfile = async (req, res) => {
     }
 
     const updatedUser = await user.save();
-    const streak = await calculateUserStreak(updatedUser._id);
+    const streak = await calculateUserStreak(updatedUser._id, tzOffset);
     res.json({
       _id: updatedUser._id,
       name: updatedUser.name,
